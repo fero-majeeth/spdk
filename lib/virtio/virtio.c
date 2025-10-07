@@ -19,6 +19,41 @@
 #define virtio_rmb()	spdk_smp_rmb()
 #define virtio_wmb()	spdk_smp_wmb()
 
+
+static inline void
+virtqueue_store_flags_packed(struct vring_packed_desc *dp,
+                              uint16_t flags)
+{
+                virtio_wmb();
+                dp->flags = flags;
+}
+
+static inline uint16_t
+virtqueue_fetch_flags_packed(struct vring_packed_desc *dp)
+{
+	uint16_t flags;
+
+	flags = dp->flags;
+	virtio_rmb();
+
+        return flags;
+}
+
+
+static inline int
+desc_is_used(struct vring_packed_desc *desc, struct virtqueue *vq)
+{
+        uint16_t used, avail, flags;
+
+        flags = virtqueue_fetch_flags_packed(desc);
+        used = !!(flags & SPDK_VRING_PACKED_DESC_F_USED);
+	avail = !!(flags & SPDK_VRING_PACKED_DESC_F_AVAIL);
+
+	int is_used = (avail == used) && (used == vq->vq_packed.used_wrap_counter);
+
+	return is_used;
+}
+
 /* Chain all the descriptors in the ring with an END */
 static inline void
 vring_desc_init(struct vring_desc *dp, uint16_t n)
@@ -35,14 +70,12 @@ static void
 virtio_init_vring(struct virtqueue *vq)
 {
 	int size = vq->vq_nentries;
-	struct vring *vr = &vq->vq_ring;
 	uint8_t *ring_mem = vq->vq_ring_virt_mem;
 
 	/*
 	 * Reinitialise since virtio port might have been stopped and restarted
 	 */
 	memset(ring_mem, 0, vq->vq_ring_size);
-	vring_init(vr, size, ring_mem, VIRTIO_PCI_VRING_ALIGN);
 	vq->vq_used_cons_idx = 0;
 	vq->vq_desc_head_idx = 0;
 	vq->vq_avail_idx = 0;
@@ -52,19 +85,22 @@ virtio_init_vring(struct virtqueue *vq)
 	vq->req_end = VQ_RING_DESC_CHAIN_END;
 	vq->reqs_finished = 0;
 	memset(vq->vq_descx, 0, sizeof(struct vq_desc_extra) * vq->vq_nentries);
-
-	vring_desc_init(vr->desc, size);
-
-	/* Tell the backend not to interrupt us.
-	 * If F_EVENT_IDX is negotiated, we will always set incredibly high
-	 * used event idx, so that we will practically never receive an
-	 * interrupt. See virtqueue_req_flush()
-	 */
-	if (vq->vdev->negotiated_features & (1ULL << VIRTIO_RING_F_EVENT_IDX)) {
-		vring_used_event(&vq->vq_ring) = UINT16_MAX;
-	} else {
-		vq->vq_ring.avail->flags |= VRING_AVAIL_F_NO_INTERRUPT;
+	if (virtio_with_packed_queue(vq->vdev))
+	{
+		vring_init_packed(&vq->vq_packed.ring, ring_mem, vq->vq_ring_mem,
+				VIRTIO_PCI_VRING_ALIGN, size);
+		vring_desc_init_packed(vq, size);
+		virtqueue_disable_intr_packed(vq);
 	}
+	else
+	{
+
+		struct vring *vr = &vq->vq_split.ring;
+		vring_init(vr, size, ring_mem, VIRTIO_PCI_VRING_ALIGN);
+		vring_desc_init(vr->desc, size);
+		virtqueue_disable_intr_split(vq);
+	}
+
 }
 
 static int
@@ -74,21 +110,18 @@ virtio_init_queue(struct virtio_dev *dev, uint16_t vtpci_queue_idx)
 	struct virtqueue *vq;
 	int rc;
 
-	SPDK_DEBUGLOG(virtio_dev, "setting up queue: %"PRIu16"\n", vtpci_queue_idx);
-
 	/*
 	 * Read the virtqueue size from the Queue Size field
 	 * Always power of 2 and if 0 virtqueue does not exist
 	 */
 	vq_size = virtio_dev_backend_ops(dev)->get_queue_size(dev, vtpci_queue_idx);
-	SPDK_DEBUGLOG(virtio_dev, "vq_size: %u\n", vq_size);
 	if (vq_size == 0) {
 		SPDK_ERRLOG("virtqueue %"PRIu16" does not exist\n", vtpci_queue_idx);
 		return -EINVAL;
 	}
 
-	if (!spdk_u32_is_pow2(vq_size)) {
-		SPDK_ERRLOG("virtqueue %"PRIu16" size (%u) is not powerof 2\n",
+	if (!virtio_with_packed_queue(dev) && !spdk_u32_is_pow2(vq_size)) {
+		SPDK_ERRLOG("split virtqueue %"PRIu16" size (%u) is not powerof 2\n",
 			    vtpci_queue_idx, vq_size);
 		return -EINVAL;
 	}
@@ -109,7 +142,20 @@ virtio_init_queue(struct virtio_dev *dev, uint16_t vtpci_queue_idx)
 	/*
 	 * Reserve a memzone for vring elements
 	 */
-	size = vring_size(vq_size, VIRTIO_PCI_VRING_ALIGN);
+
+	if (virtio_with_packed_queue(dev))
+	{
+		vq->vq_packed.used_wrap_counter = 1;
+		vq->vq_packed.cached_flags = SPDK_VRING_PACKED_DESC_F_AVAIL;
+		vq->vq_packed.event_flags_shadow = 0;
+		size = vring_size_packed(vq_size, VIRTIO_PCI_VRING_ALIGN);
+
+	}
+	else
+	{
+		size = vring_size(vq_size, VIRTIO_PCI_VRING_ALIGN);
+	}
+
 	vq->vq_ring_size = SPDK_ALIGN_CEIL(size, VIRTIO_PCI_VRING_ALIGN);
 	SPDK_DEBUGLOG(virtio_dev, "vring_size: %u, rounded_vring_size: %u\n",
 		      size, vq->vq_ring_size);
@@ -210,9 +256,6 @@ virtio_negotiate_features(struct virtio_dev *dev, uint64_t req_features)
 		return rc;
 	}
 
-	SPDK_DEBUGLOG(virtio_dev, "negotiated features = %" PRIx64 "\n",
-		      dev->negotiated_features);
-
 	virtio_dev_set_status(dev, VIRTIO_CONFIG_S_FEATURES_OK);
 	if (!(virtio_dev_get_status(dev) & VIRTIO_CONFIG_S_FEATURES_OK)) {
 		SPDK_ERRLOG("failed to set FEATURES_OK status!\n");
@@ -304,13 +347,13 @@ vq_ring_free_chain(struct virtqueue *vq, uint16_t desc_idx)
 	struct vq_desc_extra *dxp;
 	uint16_t desc_idx_last = desc_idx;
 
-	dp  = &vq->vq_ring.desc[desc_idx];
+	dp  = &vq->vq_split.ring.desc[desc_idx];
 	dxp = &vq->vq_descx[desc_idx];
 	vq->vq_free_cnt = (uint16_t)(vq->vq_free_cnt + dxp->ndescs);
 	if ((dp->flags & VRING_DESC_F_INDIRECT) == 0) {
 		while (dp->flags & VRING_DESC_F_NEXT) {
 			desc_idx_last = dp->next;
-			dp = &vq->vq_ring.desc[dp->next];
+			dp = &vq->vq_split.ring.desc[dp->next];
 		}
 	}
 	dxp->ndescs = 0;
@@ -323,7 +366,7 @@ vq_ring_free_chain(struct virtqueue *vq, uint16_t desc_idx)
 	if (vq->vq_desc_tail_idx == VQ_RING_DESC_CHAIN_END) {
 		vq->vq_desc_head_idx = desc_idx;
 	} else {
-		dp_tail = &vq->vq_ring.desc[vq->vq_desc_tail_idx];
+		dp_tail = &vq->vq_split.ring.desc[vq->vq_desc_tail_idx];
 		dp_tail->next = desc_idx;
 	}
 
@@ -332,7 +375,7 @@ vq_ring_free_chain(struct virtqueue *vq, uint16_t desc_idx)
 }
 
 static uint16_t
-virtqueue_dequeue_burst_rx(struct virtqueue *vq, void **rx_pkts,
+virtqueue_dequeue_burst_rx_split(struct virtqueue *vq, void **rx_pkts,
 			   uint32_t *len, uint16_t num)
 {
 	struct vring_used_elem *uep;
@@ -343,7 +386,7 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq, void **rx_pkts,
 	/*  Caller does the check */
 	for (i = 0; i < num ; i++) {
 		used_idx = (uint16_t)(vq->vq_used_cons_idx & (vq->vq_nentries - 1));
-		uep = &vq->vq_ring.used->ring[used_idx];
+		uep = &vq->vq_split.ring.used->ring[used_idx];
 		desc_idx = (uint16_t) uep->id;
 		len[i] = uep->len;
 		cookie = vq->vq_descx[desc_idx].cookie;
@@ -365,15 +408,78 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq, void **rx_pkts,
 	return i;
 }
 
+static uint16_t
+virtqueue_dequeue_burst_rx_packed(struct virtqueue *vq, void **rx_pkts, uint32_t *len, uint16_t num)
+{
+    struct vring_packed_desc *desc = vq->vq_packed.ring.desc;
+    uint16_t used_idx;
+    uint16_t id;
+    void *cookie;
+    uint16_t i;
+
+    for (i = 0; i < num; i++) {
+        used_idx = vq->vq_used_cons_idx;
+
+        /* Verify descriptor is used */
+        if (spdk_unlikely(!desc_is_used(&desc[used_idx], vq))) {
+            break;
+        }
+
+        id = used_idx; /* our request index was the head index when request started */
+        if (id >= vq->vq_nentries) {
+            break;
+        }
+
+        struct vq_desc_extra *dxp = &vq->vq_descx[id];
+
+        if (spdk_unlikely(dxp->cookie == NULL || dxp->ndescs == 0)) {
+            break;
+        }
+
+        uint16_t ndescs = dxp->ndescs;
+        uint16_t last_idx = (used_idx + ndescs - 1) % vq->vq_nentries;
+
+        uint8_t *status = (uint8_t *)(uintptr_t)desc[last_idx].addr;
+
+        uint16_t data_idx = (used_idx + 1) % vq->vq_nentries;
+        len[i] = desc[data_idx].len;
+
+        cookie = dxp->cookie;
+        if (spdk_unlikely(cookie == NULL)) {
+            break;
+        }
+
+        if (*status != 0) {
+            SPDK_ERRLOG("Request id=%u failed with status=%u\n", id, *status);
+        }
+
+        __builtin_prefetch(cookie);
+
+        rx_pkts[i] = cookie;
+
+        vq->vq_free_cnt += ndescs; /* reclaim chain */
+        vq->vq_used_cons_idx += ndescs; /* advance past chain */
+        dxp->cookie = NULL;
+
+        /* Handle wrap-around of the used index and toggle wrap counter */
+        if (vq->vq_used_cons_idx >= vq->vq_nentries) {
+            vq->vq_used_cons_idx -= vq->vq_nentries;
+            vq->vq_packed.used_wrap_counter ^= 1;
+        }
+
+    }
+
+    return i;
+}
+
 static void
 finish_req(struct virtqueue *vq)
 {
 	struct vring_desc *desc;
 	uint16_t avail_idx;
 
-	desc = &vq->vq_ring.desc[vq->req_end];
+	desc = &vq->vq_split.ring.desc[vq->req_end];
 	desc->flags &= ~VRING_DESC_F_NEXT;
-
 	/*
 	 * Place the head of the descriptor chain into the next slot and make
 	 * it usable to the host. The chain is made available now rather than
@@ -382,11 +488,11 @@ finish_req(struct virtqueue *vq)
 	 * descriptor.
 	 */
 	avail_idx = (uint16_t)(vq->vq_avail_idx & (vq->vq_nentries - 1));
-	vq->vq_ring.avail->ring[avail_idx] = vq->req_start;
+	vq->vq_split.ring.avail->ring[avail_idx] = vq->req_start;
 	vq->vq_avail_idx++;
 	vq->req_end = VQ_RING_DESC_CHAIN_END;
 	virtio_wmb();
-	vq->vq_ring.avail->idx = vq->vq_avail_idx;
+	vq->vq_split.ring.avail->idx = vq->vq_avail_idx;
 	vq->reqs_finished++;
 }
 
@@ -401,19 +507,84 @@ virtqueue_req_start(struct virtqueue *vq, void *cookie, int iovcnt)
 	}
 
 	if (vq->req_end != VQ_RING_DESC_CHAIN_END) {
-		finish_req(vq);
+		if (!virtio_with_packed_queue(vq->vdev)) {
+			finish_req(vq);  /* Only for split */
+		} else {
+			/* For packed, just reset req_end; flush handles finalization */
+			vq->req_end = VQ_RING_DESC_CHAIN_END;
+		}
 	}
 
 	vq->req_start = vq->vq_desc_head_idx;
 	dxp = &vq->vq_descx[vq->req_start];
 	dxp->cookie = cookie;
 	dxp->ndescs = 0;
+	dxp->head_idx = vq->vq_desc_head_idx;
+	dxp->last_idx = 0;
+        vq->req_end = vq->req_start;
 
 	return 0;
 }
 
-void
-virtqueue_req_flush(struct virtqueue *vq)
+
+static inline int
+virtqueue_kick_prepare_packed(struct virtqueue *vq)
+{
+    uint16_t flags;
+
+    /* Ensure updated data is visible to vhost before reading the flags. */
+    virtio_mb();
+    flags = vq->vq_packed.ring.device->flags;
+
+    return flags != RING_EVENT_FLAGS_DISABLE;
+}
+
+static void
+virtqueue_req_flush_packed(struct virtqueue *vq)
+{
+	struct vring_packed_desc *desc = vq->vq_packed.ring.desc;
+	struct vq_desc_extra *dxp;
+	uint16_t id, head_idx, last_idx;
+	uint16_t head_flags;
+
+	if (vq->req_end == VQ_RING_DESC_CHAIN_END) {
+		SPDK_NOTICELOG("no non-empty requests have been started\n");
+		/* no non-empty requests have been started */
+		return;
+	}
+
+	id = vq->req_start;
+	dxp = &vq->vq_descx[id];
+	head_idx = dxp->head_idx;
+        last_idx = dxp->last_idx;
+
+        /* clear next flag in last descriptor */
+        desc[last_idx].flags &= ~VRING_DESC_F_NEXT;
+
+	desc[last_idx].flags |= vq->vq_packed.cached_flags;
+	desc[head_idx + 1].flags |= vq->vq_packed.cached_flags;
+
+
+	/* Set id on last descriptor */
+	desc[last_idx].id = id;
+	desc[head_idx].id = id;
+
+        head_flags = desc[head_idx].flags;
+	head_flags |= vq->vq_packed.cached_flags;
+
+	virtqueue_store_flags_packed(&desc[head_idx], head_flags);
+
+	if (virtqueue_kick_prepare_packed(vq)) {
+		virtio_dev_backend_ops(vq->vdev)->notify_queue(vq->vdev, vq);
+	}
+
+	vq->req_end = VQ_RING_DESC_CHAIN_END;
+	vq->req_start = VQ_RING_DESC_CHAIN_END;
+	vq->reqs_finished++;
+}
+
+static void
+virtqueue_req_flush_split(struct virtqueue *vq)
 {
 	uint16_t reqs_finished;
 
@@ -432,20 +603,31 @@ virtqueue_req_flush(struct virtqueue *vq)
 		/* Set used event idx to a value the device will never reach.
 		 * This effectively disables interrupts.
 		 */
-		vring_used_event(&vq->vq_ring) = vq->vq_used_cons_idx - vq->vq_nentries - 1;
+		vring_used_event(&vq->vq_split.ring) = vq->vq_used_cons_idx - vq->vq_nentries - 1;
 
-		if (!vring_need_event(vring_avail_event(&vq->vq_ring),
+		if (!vring_need_event(vring_avail_event(&vq->vq_split.ring),
 				      vq->vq_avail_idx,
 				      vq->vq_avail_idx - reqs_finished)) {
 			return;
 		}
-	} else if (vq->vq_ring.used->flags & VRING_USED_F_NO_NOTIFY) {
+	} else if (vq->vq_split.ring.used->flags & VRING_USED_F_NO_NOTIFY) {
 		return;
 	}
 
 	virtio_dev_backend_ops(vq->vdev)->notify_queue(vq->vdev, vq);
 	SPDK_DEBUGLOG(virtio_dev, "Notified backend after xmit\n");
 }
+
+void
+virtqueue_req_flush(struct virtqueue *vq)
+{
+	if (virtio_with_packed_queue(vq->vdev)) {
+		virtqueue_req_flush_packed(vq);
+	} else {
+		virtqueue_req_flush_split(vq);
+	}
+}
+
 
 void
 virtqueue_req_abort(struct virtqueue *vq)
@@ -457,15 +639,98 @@ virtqueue_req_abort(struct virtqueue *vq)
 		return;
 	}
 
-	desc = &vq->vq_ring.desc[vq->req_end];
+	desc = &vq->vq_split.ring.desc[vq->req_end];
 	desc->flags &= ~VRING_DESC_F_NEXT;
 
 	vq_ring_free_chain(vq, vq->req_start);
 	vq->req_start = VQ_RING_DESC_CHAIN_END;
 }
 
-void
-virtqueue_req_add_iovs(struct virtqueue *vq, struct iovec *iovs, uint16_t iovcnt,
+static void
+virtqueue_req_add_iovs_packed(struct virtqueue *vq, struct iovec *iovs, uint16_t iovcnt,
+                              enum spdk_virtio_desc_type desc_type)
+{
+	struct vring_packed_desc *desc;
+	struct vq_desc_extra *dxp;
+	uint16_t i, desc_idx, prev_idx = 0;
+	uint64_t processed_length, iovec_length, current_length;
+	void *current_base;
+	uint16_t used_desc_count = 0;
+	uint16_t id;
+	uint16_t flag_desc = VRING_DESC_F_NEXT;
+
+	/* Validate preconditions */
+	assert(vq->req_start != VQ_RING_DESC_CHAIN_END);
+	assert(iovcnt <= vq->vq_free_cnt);
+
+	desc = vq->vq_packed.ring.desc;
+	desc_idx = vq->vq_desc_head_idx;
+	id = vq->req_start;
+	dxp = &vq->vq_descx[id];
+
+	for (i = 0; i < iovcnt; ++i) {
+		processed_length = 0;
+		iovec_length = iovs[i].iov_len;
+		current_base = iovs[i].iov_base;
+
+		if (!current_base || iovec_length == 0) {
+			SPDK_ERRLOG("Invalid iovec[%d]: base=%p, len=%zu\n",
+					i, current_base, iovec_length);
+			return; /* Caller should handle failure */
+		}
+
+		while (processed_length < iovec_length) {
+			if (desc_idx >= vq->vq_nentries) {
+				desc_idx -= vq->vq_nentries;
+				vq->vq_packed.cached_flags ^= VRING_PACKED_DESC_F_AVAIL_USED;
+			}
+
+			current_length = iovec_length - processed_length;
+
+			desc[desc_idx].id = 0;
+			desc[desc_idx].flags = desc_type | flag_desc;
+			desc[desc_idx].len = current_length;
+
+			if (!vq->vdev->is_hw) {
+				desc[desc_idx].addr = (uintptr_t)current_base;
+			} else {
+				desc[desc_idx].addr = spdk_vtophys(current_base, &current_length);
+				if (desc[desc_idx].addr == SPDK_VTOPHYS_ERROR) {
+					SPDK_ERRLOG("spdk_vtophys failed for base=%p\n", current_base);
+					return;
+				}
+			}
+
+			prev_idx = desc_idx;
+			used_desc_count++;
+			desc_idx++;
+
+			processed_length += current_length;
+			current_base += current_length;
+		}
+	}
+
+	dxp->ndescs += used_desc_count;
+	dxp->last_idx = prev_idx;
+	vq->vq_free_cnt -= used_desc_count;
+
+	if (desc_idx >= vq->vq_nentries) {
+		desc_idx -= vq->vq_nentries;
+		vq->vq_packed.cached_flags ^=
+			VRING_PACKED_DESC_F_AVAIL_USED;
+	}
+
+	vq->vq_avail_idx = desc_idx;
+	vq->vq_desc_head_idx = desc_idx;
+
+	if (vq->vq_free_cnt == 0) {
+		vq->vq_desc_tail_idx = VQ_RING_DESC_CHAIN_END;
+	}
+}
+
+
+static void
+virtqueue_req_add_iovs_split(struct virtqueue *vq, struct iovec *iovs, uint16_t iovcnt,
 		       enum spdk_virtio_desc_type desc_type)
 {
 	struct vring_desc *desc;
@@ -490,7 +755,7 @@ virtqueue_req_add_iovs(struct virtqueue *vq, struct iovec *iovs, uint16_t iovcnt
 		current_base = iovs[i].iov_base;
 
 		while (processed_length < iovec_length) {
-			desc = &vq->vq_ring.desc[new_head];
+			desc = &vq->vq_split.ring.desc[new_head];
 			current_length = iovec_length - processed_length;
 
 			if (!vq->vdev->is_hw) {
@@ -526,13 +791,36 @@ virtqueue_req_add_iovs(struct virtqueue *vq, struct iovec *iovs, uint16_t iovcnt
 	}
 }
 
+void
+virtqueue_req_add_iovs(struct virtqueue *vq, struct iovec *iovs, uint16_t iovcnt,
+		enum spdk_virtio_desc_type desc_type)
+{
+	if (virtio_with_packed_queue(vq->vdev)) {
+		virtqueue_req_add_iovs_packed(vq, iovs, iovcnt, desc_type);
+	} else {
+		virtqueue_req_add_iovs_split(vq, iovs, iovcnt, desc_type);
+	}
+}
+
 #define DESC_PER_CACHELINE (SPDK_CACHE_LINE_SIZE / sizeof(struct vring_desc))
 uint16_t
 virtio_recv_pkts(struct virtqueue *vq, void **io, uint32_t *len, uint16_t nb_pkts)
 {
 	uint16_t nb_used, num;
 
-	nb_used = vq->vq_ring.used->idx - vq->vq_used_cons_idx;
+    if (virtio_with_packed_queue(vq->vdev)) {
+        /* For packed queue, scan used descriptors */
+        for (num = 0; num < nb_pkts; num++) {
+            uint16_t idx = (vq->vq_used_cons_idx + num) % vq->vq_nentries;
+            if (!desc_is_used(&vq->vq_packed.ring.desc[idx], vq)) {
+                break;
+            }
+        }
+
+        return virtqueue_dequeue_burst_rx_packed(vq, io, len, num);
+    } else {
+
+	nb_used = vq->vq_split.ring.used->idx - vq->vq_used_cons_idx;
 	virtio_rmb();
 
 	num = (uint16_t)(spdk_likely(nb_used <= nb_pkts) ? nb_used : nb_pkts);
@@ -540,7 +828,8 @@ virtio_recv_pkts(struct virtqueue *vq, void **io, uint32_t *len, uint16_t nb_pkt
 		num = num - ((vq->vq_used_cons_idx + num) % DESC_PER_CACHELINE);
 	}
 
-	return virtqueue_dequeue_burst_rx(vq, io, len, num);
+	return virtqueue_dequeue_burst_rx_split(vq, io, len, num);
+    }
 }
 
 int
