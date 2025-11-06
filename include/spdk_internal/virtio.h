@@ -40,6 +40,9 @@
 
 #define VRING_PACKED_DESC_F_AVAIL_USED  (SPDK_VRING_PACKED_DESC_F_AVAIL | \
                                          SPDK_VRING_PACKED_DESC_F_USED)
+
+#define VIRTIO_F_NOTIFICATION_DATA 38
+
 struct virtio_dev_ops;
 
 
@@ -120,6 +123,9 @@ struct virtio_dev_ops {
 
 	void (*dump_json_info)(struct virtio_dev *hw, struct spdk_json_write_ctx *w);
 	void (*write_json_config)(struct virtio_dev *hw, struct spdk_json_write_ctx *w);
+
+        int (*init_notify_queue)(struct virtio_dev *vdev, uint16_t max_queues);
+        void (*uninit_notify_queue)(struct virtio_dev *vdev,  uint16_t max_queues);
 };
 
 struct vq_desc_extra {

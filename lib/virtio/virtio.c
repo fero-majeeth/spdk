@@ -115,6 +115,7 @@ virtio_init_queue(struct virtio_dev *dev, uint16_t vtpci_queue_idx)
 	 * Always power of 2 and if 0 virtqueue does not exist
 	 */
 	vq_size = virtio_dev_backend_ops(dev)->get_queue_size(dev, vtpci_queue_idx);
+	SPDK_DEBUGLOG(virtio_dev, "vq_size: %u\n", vq_size);
 	if (vq_size == 0) {
 		SPDK_ERRLOG("virtqueue %"PRIu16" does not exist\n", vtpci_queue_idx);
 		return -EINVAL;
@@ -190,6 +191,8 @@ virtio_free_queues(struct virtio_dev *dev)
 		return;
 	}
 
+	virtio_dev_backend_ops(dev)->uninit_notify_queue(dev, nr_vq);
+
 	for (i = 0; i < nr_vq; i++) {
 		vq = dev->vqs[i];
 		if (!vq) {
@@ -218,6 +221,12 @@ virtio_alloc_queues(struct virtio_dev *dev, uint16_t max_queues, uint16_t fixed_
 	}
 
 	assert(dev->vqs == NULL);
+
+	ret = virtio_dev_backend_ops(dev)->init_notify_queue(dev, max_queues);
+	if (ret < 0) {
+		return ret;
+	}
+
 	dev->vqs = calloc(1, sizeof(struct virtqueue *) * max_queues);
 	if (!dev->vqs) {
 		SPDK_ERRLOG("failed to allocate %"PRIu16" vqs\n", max_queues);

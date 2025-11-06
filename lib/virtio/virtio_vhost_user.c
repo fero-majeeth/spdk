@@ -10,487 +10,69 @@
 #include "spdk/string.h"
 #include "spdk/config.h"
 #include "spdk/util.h"
-
+#include "spdk/barrier.h"
 #include "spdk_internal/virtio.h"
 #include "spdk_internal/vhost_user.h"
+#include "virtio_user_dev.h"
+#include "vhost.h"
 
-/* The version of the protocol we support */
-#define VHOST_USER_VERSION    0x1
 
-#define VIRTIO_USER_SUPPORTED_PROTOCOL_FEATURES \
-	((1ULL << VHOST_USER_PROTOCOL_F_MQ) | \
-	(1ULL << VHOST_USER_PROTOCOL_F_CONFIG))
+static inline void
+spdk_write16_relaxed(uint16_t value, volatile void *addr)
+{
+        *(volatile uint16_t *)addr = value;
+}
 
-struct virtio_user_queue {
-        uint16_t used_idx;
-        bool avail_wrap_counter;
-        bool used_wrap_counter;
-};
+static inline void
+spdk_write32_relaxed(uint32_t value, volatile void *addr)
+{
+        *(volatile uint32_t *)addr = value;
+}
 
-struct virtio_user_dev {
-	int		vhostfd;
 
-	int		callfds[SPDK_VIRTIO_MAX_VIRTQUEUES];
-	int		kickfds[SPDK_VIRTIO_MAX_VIRTQUEUES];
-	uint32_t	queue_size;
+static inline void
+spdk_write16(uint16_t value, volatile void *addr)
+{
+        spdk_wmb();
+        spdk_write16_relaxed(value, addr);
+}
 
-	uint8_t		status;
-	bool		is_stopping;
-	char		path[PATH_MAX];
-	uint64_t	protocol_features;
 
-	union {
-		struct vring    split[SPDK_VIRTIO_MAX_VIRTQUEUES];
-		struct vring_packed packed[SPDK_VIRTIO_MAX_VIRTQUEUES];
-	} vrings;
 
-	struct virtio_user_queue packed_queues[SPDK_VIRTIO_MAX_VIRTQUEUES];
+static inline void
+spdk_write32(uint32_t value, volatile void *addr)
+{
+        spdk_wmb();
+        spdk_write32_relaxed(value, addr);
+}
 
-	struct spdk_mem_map *mem_map;
-};
 
 static int
-vhost_user_write(int fd, void *buf, int len, int *fds, int fd_num)
+virtio_user_dev_set_status(struct virtio_user_dev *dev, uint8_t status)
 {
-	int r;
-	struct msghdr msgh;
-	struct iovec iov;
-	size_t fd_size = fd_num * sizeof(int);
-	char control[CMSG_SPACE(fd_size)];
-	struct cmsghdr *cmsg;
+        int ret;
 
-	memset(&msgh, 0, sizeof(msgh));
-	memset(control, 0, sizeof(control));
+        ret = dev->ops->set_status(dev, status);
+        if (ret && ret != -ENOTSUP)
+                SPDK_ERRLOG("(%s) Failed to set backend status", dev->path);
 
-	iov.iov_base = (uint8_t *)buf;
-	iov.iov_len = len;
-
-	msgh.msg_iov = &iov;
-	msgh.msg_iovlen = 1;
-
-	if (fds && fd_num > 0) {
-		msgh.msg_control = control;
-		msgh.msg_controllen = sizeof(control);
-		cmsg = CMSG_FIRSTHDR(&msgh);
-		if (!cmsg) {
-			SPDK_WARNLOG("First HDR is NULL\n");
-			return -EIO;
-		}
-		cmsg->cmsg_len = CMSG_LEN(fd_size);
-		cmsg->cmsg_level = SOL_SOCKET;
-		cmsg->cmsg_type = SCM_RIGHTS;
-		memcpy(CMSG_DATA(cmsg), fds, fd_size);
-	} else {
-		msgh.msg_control = NULL;
-		msgh.msg_controllen = 0;
-	}
-
-	do {
-		r = sendmsg(fd, &msgh, 0);
-	} while (r < 0 && errno == EINTR);
-
-	if (r == -1) {
-		return -errno;
-	}
-
-	return 0;
+        return ret;
 }
 
 static int
-vhost_user_read(int fd, struct vhost_user_msg *msg)
+virtio_user_dev_update_status(struct virtio_user_dev *dev)
 {
-	uint32_t valid_flags = VHOST_USER_REPLY_MASK | VHOST_USER_VERSION;
-	ssize_t ret;
-	size_t sz_hdr = VHOST_USER_HDR_SIZE, sz_payload;
+        int ret;
+        uint8_t status;
 
-	ret = recv(fd, (void *)msg, sz_hdr, 0);
-	if ((size_t)ret != sz_hdr) {
-		SPDK_WARNLOG("Failed to recv msg hdr: %zd instead of %zu.\n",
-			     ret, sz_hdr);
-		if (ret == -1) {
-			return -errno;
-		} else {
-			return -EBUSY;
-		}
-	}
+        ret = dev->ops->get_status(dev, &status);
+        if (!ret) {
+                dev->status = status;
+        } else if (ret != -ENOTSUP) {
+                SPDK_ERRLOG("(%s) Failed to get backend status\n", dev->path);
+        }
 
-	/* validate msg flags */
-	if (msg->flags != (valid_flags)) {
-		SPDK_WARNLOG("Failed to recv msg: flags %"PRIx32" instead of %"PRIx32".\n",
-			     msg->flags, valid_flags);
-		return -EIO;
-	}
-
-	sz_payload = msg->size;
-
-	if (sz_payload > VHOST_USER_PAYLOAD_SIZE) {
-		SPDK_WARNLOG("Received oversized msg: payload size %zu > available space %zu\n",
-			     sz_payload, VHOST_USER_PAYLOAD_SIZE);
-		return -EIO;
-	}
-
-	if (sz_payload) {
-		ret = recv(fd, (void *)((char *)msg + sz_hdr), sz_payload, 0);
-		if ((size_t)ret != sz_payload) {
-			SPDK_WARNLOG("Failed to recv msg payload: %zd instead of %"PRIu32".\n",
-				     ret, msg->size);
-			if (ret == -1) {
-				return -errno;
-			} else {
-				return -EBUSY;
-			}
-		}
-	}
-
-	return 0;
-}
-
-struct hugepage_file_info {
-	uint64_t addr;            /**< virtual addr */
-	size_t   size;            /**< the file size */
-	char     path[PATH_MAX];  /**< path to backing file */
-};
-
-/* Two possible options:
- * 1. Match HUGEPAGE_INFO_FMT to find the file storing struct hugepage_file
- * array. This is simple but cannot be used in secondary process because
- * secondary process will close and munmap that file.
- * 2. Match HUGEFILE_FMT to find hugepage files directly.
- *
- * We choose option 2.
- */
-static int
-get_hugepage_file_info(struct hugepage_file_info hugepages[], int max)
-{
-	int idx, rc;
-	FILE *f;
-	char buf[BUFSIZ], *tmp, *tail;
-	char *str_underline, *str_start;
-	int huge_index;
-	uint64_t v_start, v_end;
-
-	f = fopen("/proc/self/maps", "r");
-	if (!f) {
-		SPDK_ERRLOG("cannot open /proc/self/maps\n");
-		rc = -errno;
-		assert(rc < 0); /* scan-build hack */
-		return rc;
-	}
-
-	idx = 0;
-	while (fgets(buf, sizeof(buf), f) != NULL) {
-		if (sscanf(buf, "%" PRIx64 "-%" PRIx64, &v_start, &v_end) < 2) {
-			SPDK_ERRLOG("Failed to parse address\n");
-			rc = -EIO;
-			goto out;
-		}
-
-		tmp = strchr(buf, ' ') + 1; /** skip address */
-		tmp = strchr(tmp, ' ') + 1; /** skip perm */
-		tmp = strchr(tmp, ' ') + 1; /** skip offset */
-		tmp = strchr(tmp, ' ') + 1; /** skip dev */
-		tmp = strchr(tmp, ' ') + 1; /** skip inode */
-		while (*tmp == ' ') {       /** skip spaces */
-			tmp++;
-		}
-		tail = strrchr(tmp, '\n');  /** remove newline if exists */
-		if (tail) {
-			*tail = '\0';
-		}
-
-		/* Match HUGEFILE_FMT, aka "%s/%smap_%d",
-		 * which is defined in eal_filesystem.h
-		 */
-		str_underline = strrchr(tmp, '_');
-		if (!str_underline) {
-			continue;
-		}
-
-		str_start = str_underline - strlen("map");
-		if (str_start < tmp) {
-			continue;
-		}
-
-		if (sscanf(str_start, "map_%d", &huge_index) != 1) {
-			continue;
-		}
-
-		if (idx >= max) {
-			SPDK_ERRLOG("Exceed maximum of %d\n", max);
-			rc = -ENOSPC;
-			goto out;
-		}
-
-		if (idx > 0 &&
-		    strncmp(tmp, hugepages[idx - 1].path, PATH_MAX) == 0 &&
-		    v_start == hugepages[idx - 1].addr + hugepages[idx - 1].size) {
-			hugepages[idx - 1].size += (v_end - v_start);
-			continue;
-		}
-
-		hugepages[idx].addr = v_start;
-		hugepages[idx].size = v_end - v_start;
-		snprintf(hugepages[idx].path, PATH_MAX, "%s", tmp);
-		idx++;
-	}
-
-	rc = idx;
-out:
-	fclose(f);
-	return rc;
-}
-
-static int
-prepare_vhost_memory_user(struct vhost_user_msg *msg, int fds[])
-{
-	int i, num;
-	struct hugepage_file_info hugepages[VHOST_USER_MEMORY_MAX_NREGIONS];
-
-	num = get_hugepage_file_info(hugepages, VHOST_USER_MEMORY_MAX_NREGIONS);
-	if (num < 0) {
-		SPDK_ERRLOG("Failed to prepare memory for vhost-user\n");
-		return num;
-	}
-
-	for (i = 0; i < num; ++i) {
-		/* the memory regions are unaligned */
-		msg->payload.memory.regions[i].guest_phys_addr = hugepages[i].addr; /* use vaddr! */
-		msg->payload.memory.regions[i].userspace_addr = hugepages[i].addr;
-		msg->payload.memory.regions[i].memory_size = hugepages[i].size;
-		msg->payload.memory.regions[i].flags_padding = 0;
-		fds[i] = open(hugepages[i].path, O_RDWR);
-	}
-
-	msg->payload.memory.nregions = num;
-	msg->payload.memory.padding = 0;
-
-	return 0;
-}
-
-static const char *const vhost_msg_strings[VHOST_USER_MAX] = {
-	[VHOST_USER_SET_OWNER] = "VHOST_SET_OWNER",
-	[VHOST_USER_RESET_OWNER] = "VHOST_RESET_OWNER",
-	[VHOST_USER_SET_FEATURES] = "VHOST_SET_FEATURES",
-	[VHOST_USER_GET_FEATURES] = "VHOST_GET_FEATURES",
-	[VHOST_USER_SET_VRING_CALL] = "VHOST_SET_VRING_CALL",
-	[VHOST_USER_GET_PROTOCOL_FEATURES] = "VHOST_USER_GET_PROTOCOL_FEATURES",
-	[VHOST_USER_SET_PROTOCOL_FEATURES] = "VHOST_USER_SET_PROTOCOL_FEATURES",
-	[VHOST_USER_SET_VRING_NUM] = "VHOST_SET_VRING_NUM",
-	[VHOST_USER_SET_VRING_BASE] = "VHOST_SET_VRING_BASE",
-	[VHOST_USER_GET_VRING_BASE] = "VHOST_GET_VRING_BASE",
-	[VHOST_USER_SET_VRING_ADDR] = "VHOST_SET_VRING_ADDR",
-	[VHOST_USER_SET_VRING_KICK] = "VHOST_SET_VRING_KICK",
-	[VHOST_USER_SET_MEM_TABLE] = "VHOST_SET_MEM_TABLE",
-	[VHOST_USER_SET_VRING_ENABLE] = "VHOST_SET_VRING_ENABLE",
-	[VHOST_USER_GET_QUEUE_NUM] = "VHOST_USER_GET_QUEUE_NUM",
-	[VHOST_USER_GET_CONFIG] = "VHOST_USER_GET_CONFIG",
-	[VHOST_USER_SET_CONFIG] = "VHOST_USER_SET_CONFIG",
-};
-
-static int
-vhost_user_sock(struct virtio_user_dev *dev,
-		enum vhost_user_request req,
-		void *arg)
-{
-	struct vhost_user_msg msg;
-	struct vhost_vring_file *file = 0;
-	int need_reply = 0;
-	int fds[VHOST_USER_MEMORY_MAX_NREGIONS];
-	int fd_num = 0;
-	int i, len, rc;
-	int vhostfd = dev->vhostfd;
-
-	SPDK_DEBUGLOG(virtio_user, "sent message %d = %s\n", req, vhost_msg_strings[req]);
-
-	msg.request = req;
-	msg.flags = VHOST_USER_VERSION;
-	msg.size = 0;
-
-	switch (req) {
-	case VHOST_USER_GET_FEATURES:
-	case VHOST_USER_GET_PROTOCOL_FEATURES:
-	case VHOST_USER_GET_QUEUE_NUM:
-		need_reply = 1;
-		break;
-
-	case VHOST_USER_SET_FEATURES:
-	case VHOST_USER_SET_LOG_BASE:
-	case VHOST_USER_SET_PROTOCOL_FEATURES:
-		msg.payload.u64 = *((__u64 *)arg);
-		msg.size = sizeof(msg.payload.u64);
-		break;
-
-	case VHOST_USER_SET_OWNER:
-	case VHOST_USER_RESET_OWNER:
-		break;
-
-	case VHOST_USER_SET_MEM_TABLE:
-		rc = prepare_vhost_memory_user(&msg, fds);
-		if (rc < 0) {
-			return rc;
-		}
-		fd_num = msg.payload.memory.nregions;
-		msg.size = sizeof(msg.payload.memory.nregions);
-		msg.size += sizeof(msg.payload.memory.padding);
-		msg.size += fd_num * sizeof(struct vhost_memory_region);
-		break;
-
-	case VHOST_USER_SET_LOG_FD:
-		fds[fd_num++] = *((int *)arg);
-		break;
-
-	case VHOST_USER_SET_VRING_NUM:
-	case VHOST_USER_SET_VRING_BASE:
-	case VHOST_USER_SET_VRING_ENABLE:
-		memcpy(&msg.payload.state, arg, sizeof(msg.payload.state));
-		msg.size = sizeof(msg.payload.state);
-		break;
-
-	case VHOST_USER_GET_VRING_BASE:
-		memcpy(&msg.payload.state, arg, sizeof(msg.payload.state));
-		msg.size = sizeof(msg.payload.state);
-		need_reply = 1;
-		break;
-
-	case VHOST_USER_SET_VRING_ADDR:
-		memcpy(&msg.payload.addr, arg, sizeof(msg.payload.addr));
-		msg.size = sizeof(msg.payload.addr);
-		break;
-
-	case VHOST_USER_SET_VRING_KICK:
-	case VHOST_USER_SET_VRING_CALL:
-	case VHOST_USER_SET_VRING_ERR:
-		file = arg;
-		msg.payload.u64 = file->index & VHOST_USER_VRING_IDX_MASK;
-		msg.size = sizeof(msg.payload.u64);
-		if (file->fd > 0) {
-			fds[fd_num++] = file->fd;
-		} else {
-			msg.payload.u64 |= VHOST_USER_VRING_NOFD_MASK;
-		}
-		break;
-
-	case VHOST_USER_GET_CONFIG:
-		memcpy(&msg.payload.cfg, arg, sizeof(msg.payload.cfg));
-		msg.size = sizeof(msg.payload.cfg);
-		need_reply = 1;
-		break;
-
-	case VHOST_USER_SET_CONFIG:
-		memcpy(&msg.payload.cfg, arg, sizeof(msg.payload.cfg));
-		msg.size = sizeof(msg.payload.cfg);
-		break;
-
-	default:
-		SPDK_ERRLOG("trying to send unknown msg\n");
-		return -EINVAL;
-	}
-
-	len = VHOST_USER_HDR_SIZE + msg.size;
-	rc = vhost_user_write(vhostfd, &msg, len, fds, fd_num);
-	if (rc < 0) {
-		SPDK_ERRLOG("%s failed: %s\n",
-			    vhost_msg_strings[req], spdk_strerror(-rc));
-		return rc;
-	}
-
-	if (req == VHOST_USER_SET_MEM_TABLE)
-		for (i = 0; i < fd_num; ++i) {
-			close(fds[i]);
-		}
-
-	if (need_reply) {
-		rc = vhost_user_read(vhostfd, &msg);
-		if (rc < 0) {
-			SPDK_WARNLOG("Received msg failed: %s\n", spdk_strerror(-rc));
-			return rc;
-		}
-
-		if (req != msg.request) {
-			SPDK_WARNLOG("Received unexpected msg type\n");
-			return -EIO;
-		}
-
-		switch (req) {
-		case VHOST_USER_GET_FEATURES:
-		case VHOST_USER_GET_PROTOCOL_FEATURES:
-		case VHOST_USER_GET_QUEUE_NUM:
-			if (msg.size != sizeof(msg.payload.u64)) {
-				SPDK_WARNLOG("Received bad msg size\n");
-				return -EIO;
-			}
-			*((__u64 *)arg) = msg.payload.u64;
-			break;
-		case VHOST_USER_GET_VRING_BASE:
-			if (msg.size != sizeof(msg.payload.state)) {
-				SPDK_WARNLOG("Received bad msg size\n");
-				return -EIO;
-			}
-			memcpy(arg, &msg.payload.state,
-			       sizeof(struct vhost_vring_state));
-			break;
-		case VHOST_USER_GET_CONFIG:
-			if (msg.size != sizeof(msg.payload.cfg)) {
-				SPDK_WARNLOG("Received bad msg size\n");
-				return -EIO;
-			}
-			memcpy(arg, &msg.payload.cfg, sizeof(msg.payload.cfg));
-			break;
-		default:
-			SPDK_WARNLOG("Received unexpected msg type\n");
-			return -EBADMSG;
-		}
-	}
-
-	return 0;
-}
-
-/**
- * Set up environment to talk with a vhost user backend.
- *
- * @return
- *   - (-1) if fail;
- *   - (0) if succeed.
- */
-static int
-vhost_user_setup(struct virtio_user_dev *dev)
-{
-	int fd;
-	int flag;
-	struct sockaddr_un un;
-	ssize_t rc;
-
-	fd = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (fd < 0) {
-		SPDK_ERRLOG("socket() error, %s\n", spdk_strerror(errno));
-		return -errno;
-	}
-
-	flag = fcntl(fd, F_GETFD);
-	if (fcntl(fd, F_SETFD, flag | FD_CLOEXEC) < 0) {
-		SPDK_ERRLOG("fcntl failed, %s\n", spdk_strerror(errno));
-	}
-
-	memset(&un, 0, sizeof(un));
-	un.sun_family = AF_UNIX;
-	rc = snprintf(un.sun_path, sizeof(un.sun_path), "%s", dev->path);
-	if (rc < 0 || (size_t)rc >= sizeof(un.sun_path)) {
-		SPDK_ERRLOG("socket path too long\n");
-		close(fd);
-		if (rc < 0) {
-			return -errno;
-		} else {
-			return -EINVAL;
-		}
-	}
-	if (connect(fd, (struct sockaddr *)&un, sizeof(un)) < 0) {
-		SPDK_ERRLOG("connect error, %s\n", spdk_strerror(errno));
-		close(fd);
-		return -errno;
-	}
-
-	dev->vhostfd = fd;
-	return 0;
+        return ret;
 }
 
 static int
@@ -506,7 +88,8 @@ virtio_user_create_queue(struct virtio_dev *vdev, uint32_t queue_sel)
 
 	file.index = queue_sel;
 	file.fd = dev->callfds[queue_sel];
-	return vhost_user_sock(dev, VHOST_USER_SET_VRING_CALL, &file);
+
+	return dev->ops->set_vring_call(dev, &file);
 }
 
 static int
@@ -523,24 +106,32 @@ virtio_user_set_vring_addr_split(struct virtio_dev *vdev, uint32_t queue_sel)
 		.flags = 0, /* disable log */
 	};
 
-	return vhost_user_sock(dev, VHOST_USER_SET_VRING_ADDR, &addr);
+	return dev->ops->set_vring_addr(dev, &addr);
 }
 
 static int
 virtio_user_set_vring_addr_packed(struct virtio_dev *vdev, uint32_t queue_sel)
 {
+	uint64_t desc_addr, avail_addr, used_addr;
         struct virtio_user_dev *dev = vdev->ctx;
         struct vring_packed *vring = &dev->vrings.packed[queue_sel];
+
+
+	desc_addr = vring->desc_iova;
+	avail_addr = desc_addr + vring->num * sizeof(struct vring_packed_desc);
+        used_addr =  SPDK_ALIGN_CEIL(avail_addr + sizeof(struct vring_packed_desc_event),
+                                            VIRTIO_PCI_VRING_ALIGN);
+
         struct vhost_vring_addr addr = {
                 .index = queue_sel,
-                .desc_user_addr = (uint64_t)(uintptr_t)vring->desc,
-                .avail_user_addr = (uint64_t)(uintptr_t)vring->driver,
-                .used_user_addr = (uint64_t)(uintptr_t)vring->device,
+                .desc_user_addr = desc_addr,
+                .avail_user_addr = avail_addr,
+                .used_user_addr = used_addr,
                 .log_guest_addr = 0,
                 .flags = 0, /* disable log */
         };
 
-        return vhost_user_sock(dev, VHOST_USER_SET_VRING_ADDR, &addr);
+        return dev->ops->set_vring_addr(dev, &addr);
 }
 
 static int
@@ -558,14 +149,13 @@ virtio_user_kick_queue(struct virtio_dev *vdev, uint32_t queue_sel)
 	if (virtio_with_packed_queue(vdev))
 	{
 		state.num = pq_vring->num;
-		SPDK_WARNLOG("%s === 1ULL << VIRTIO_F_RING_PACKED, state.num:%d\n",__func__,state.num);
 	}
 	else
 	{
 		state.num = vring->num;
 	}
 
-	rc = vhost_user_sock(dev, VHOST_USER_SET_VRING_NUM, &state);
+	rc = dev->ops->set_vring_num(dev, &state);
 	if (rc < 0) {
 		return rc;
 	}
@@ -573,20 +163,32 @@ virtio_user_kick_queue(struct virtio_dev *vdev, uint32_t queue_sel)
 	state.index = queue_sel;
 	state.num = 0; /* no reservation */
 
-	rc = vhost_user_sock(dev, VHOST_USER_SET_VRING_BASE, &state);
+	if ((virtio_with_packed_queue(vdev)))
+	{
+		state.num |= (1 << 15);
+	}
+
+	rc = dev->ops->set_vring_base(dev, &state);
 	if (rc < 0) {
+		SPDK_ERRLOG("Failed set_vring_base\n");
 		return rc;
 	}
 
         if (virtio_with_packed_queue(vdev))
         {
-
-		virtio_user_set_vring_addr_packed(vdev, queue_sel);
+		rc = virtio_user_set_vring_addr_packed(vdev, queue_sel);
+		if (rc < 0) {
+			SPDK_ERRLOG("Failed set_vring_addr\n");
+			return rc;
+		}
 	}
 	else
 	{
-		virtio_user_set_vring_addr_split(vdev, queue_sel);
-
+		rc = virtio_user_set_vring_addr_split(vdev, queue_sel);
+		if (rc < 0) {
+			SPDK_ERRLOG("Failed set_vring_addr\n");
+			return rc;
+		}
 	}
 
 	/* Of all per virtqueue MSGs, make sure VHOST_USER_SET_VRING_KICK comes
@@ -595,7 +197,14 @@ virtio_user_kick_queue(struct virtio_dev *vdev, uint32_t queue_sel)
 	 */
 	file.index = queue_sel;
 	file.fd = dev->kickfds[queue_sel];
-	return vhost_user_sock(dev, VHOST_USER_SET_VRING_KICK, &file);
+
+	rc = dev->ops->set_vring_kick(dev, &file);
+	if (rc < 0) {
+		SPDK_ERRLOG("Failed set_vring_kick\n");
+		return rc;
+	}
+
+	return 0;
 }
 
 static int
@@ -607,7 +216,7 @@ virtio_user_stop_queue(struct virtio_dev *vdev, uint32_t queue_sel)
 	state.index = queue_sel;
 	state.num = 0;
 
-	return vhost_user_sock(dev, VHOST_USER_GET_VRING_BASE, &state);
+	return dev->ops->get_vring_base(dev, &state);
 }
 
 static int
@@ -637,7 +246,10 @@ virtio_user_map_notify(void *cb_ctx, struct spdk_mem_map *map,
 	struct virtio_user_dev *dev = vdev->ctx;
 	uint64_t features;
 	int ret;
-
+	size_t page = getpagesize();
+	uint8_t *cur = vaddr;
+	uint8_t *end = cur + size;
+	int rc = 0;
 	/* We do not support dynamic memory allocation with virtio-user.  If this is the
 	 * initial notification when the device is started, dev->mem_map will be NULL.  If
 	 * this is the final notification when the device is stopped, dev->is_stopping will
@@ -650,10 +262,74 @@ virtio_user_map_notify(void *cb_ctx, struct spdk_mem_map *map,
 		return -1;
 	}
 
+
+	if (dev->backend_type == VIRTIO_USER_BACKEND_VHOST_VDPA) {
+		uint64_t run_iova = 0;
+		size_t run_len = 0;
+		uint8_t *run_vaddr = NULL;
+
+		while (cur < end) {
+			size_t phys_len = end - cur;
+			uint64_t iova = spdk_vtophys(cur, &phys_len);
+
+			if (iova == SPDK_VTOPHYS_ERROR) {
+				SPDK_ERRLOG("vDPA: spdk_vtophys failed for %p\n", cur);
+				rc = -EFAULT;
+				break;
+			}
+
+			/* Align both sides to page boundaries */
+			uintptr_t uaddr_aligned = (uintptr_t)cur & ~(page - 1);
+			uint64_t iova_aligned = iova & ~(uint64_t)(page - 1);
+			size_t head_offset = (uintptr_t)cur - uaddr_aligned;
+			size_t map_len = phys_len + head_offset;
+			map_len = (map_len + page - 1) & ~(page - 1); /* round up to full page */
+
+			/* Detect if contiguous with previous chunk */
+			if (run_len > 0 &&
+					run_vaddr + run_len == (uint8_t *)uaddr_aligned &&
+					run_iova + run_len == iova_aligned) {
+				/* Extend current coalesced region */
+				run_len += map_len;
+			} else {
+				/* Flush previous run before starting new one */
+				if (run_len > 0) {
+					if (action == SPDK_MEM_MAP_NOTIFY_REGISTER)
+						rc = dev->ops->dma_map(dev, (void *)run_vaddr, run_iova, run_len);
+					else
+						rc = dev->ops->dma_unmap(dev, (void *)run_vaddr, run_iova, run_len);
+
+					if (rc < 0)
+					{
+						break;
+					}
+				}
+
+				/* Start new contiguous run */
+				run_vaddr = (uint8_t *)uaddr_aligned;
+				run_iova = iova_aligned;
+				run_len = map_len;
+			}
+
+			cur += phys_len;
+		}
+
+		/* Flush final run */
+		if (rc == 0 && run_len > 0) {
+			if (action == SPDK_MEM_MAP_NOTIFY_REGISTER)
+				rc = dev->ops->dma_map(dev, (void *)run_vaddr, run_iova, run_len);
+			else
+				rc = dev->ops->dma_unmap(dev, (void *)run_vaddr, run_iova, run_len);
+		}
+
+		return rc;
+	}
+
+
 	/* We have to resend all mappings anyway, so don't bother with any
 	 * page tracking.
 	 */
-	ret = vhost_user_sock(dev, VHOST_USER_SET_MEM_TABLE, NULL);
+	ret = dev->ops->set_memory_table(dev);
 	if (ret < 0) {
 		return ret;
 	}
@@ -664,7 +340,8 @@ virtio_user_map_notify(void *cb_ctx, struct spdk_mem_map *map,
 	 * support it, so we send a simple message that always has a response
 	 * and we wait for that response. Messages are always processed in order.
 	 */
-	return vhost_user_sock(dev, VHOST_USER_GET_FEATURES, &features);
+
+	return dev->ops->get_features(dev, &features);
 }
 
 static int
@@ -675,12 +352,37 @@ virtio_user_register_mem(struct virtio_dev *vdev)
 		.notify_cb = virtio_user_map_notify,
 		.are_contiguous = NULL
 	};
+	int ret;
+
+	if (dev->backend_type == VIRTIO_USER_BACKEND_VHOST_VDPA) {
+
+		ret = dev->ops->iotlb_batch_begin(dev);
+                if (ret < 0) {
+                        SPDK_ERRLOG("Error iotlb_batch_begin\n");
+                        return ret;
+                }
+
+		ret = dev->ops->dma_unmap(dev, NULL, 0, SIZE_MAX);
+		if (ret < 0) {
+			SPDK_ERRLOG("Error dma_unmap\n");
+			return ret;
+		}
+	}
 
 	dev->mem_map = spdk_mem_map_alloc(0, &virtio_user_map_ops, vdev);
 	if (dev->mem_map == NULL) {
+		dev->ops->iotlb_batch_end(dev);
 		SPDK_ERRLOG("spdk_mem_map_alloc() failed\n");
 		return -1;
 	}
+
+        if (dev->backend_type == VIRTIO_USER_BACKEND_VHOST_VDPA) {
+                ret = dev->ops->iotlb_batch_end(dev);
+                if (ret < 0) {
+                        SPDK_ERRLOG("Error iotlb_batch_end\n");
+                        return ret;
+                }
+        }
 
 	return 0;
 }
@@ -689,39 +391,45 @@ static void
 virtio_user_unregister_mem(struct virtio_dev *vdev)
 {
 	struct virtio_user_dev *dev = vdev->ctx;
+        int ret;
 
 	dev->is_stopping = true;
+
+	if (dev->backend_type == VIRTIO_USER_BACKEND_VHOST_VDPA) {
+
+		ret = dev->ops->iotlb_batch_begin(dev);
+		if (ret < 0) {
+			SPDK_ERRLOG("Error iotlb_batch_begin\n");
+			return;
+		}
+
+	}
+
 	spdk_mem_map_free(&dev->mem_map);
+
+	if (dev->backend_type == VIRTIO_USER_BACKEND_VHOST_VDPA) {
+		ret = dev->ops->iotlb_batch_end(dev);
+		if (ret < 0) {
+			SPDK_ERRLOG("Error iotlb_batch_end\n");
+			return; 
+		}
+	}
+
 }
 
 static int
 virtio_user_start_device(struct virtio_dev *vdev)
 {
 	struct virtio_user_dev *dev = vdev->ctx;
-	uint64_t host_max_queues;
 	int ret;
 
-	if ((dev->protocol_features & (1ULL << VHOST_USER_PROTOCOL_F_MQ)) == 0 &&
-	    vdev->max_queues > 1 + vdev->fixed_queues_num) {
-		SPDK_WARNLOG("%s: requested %"PRIu16" request queues, but the "
-			     "host doesn't support VHOST_USER_PROTOCOL_F_MQ. "
-			     "Only one request queue will be used.\n",
-			     vdev->name, vdev->max_queues - vdev->fixed_queues_num);
-		vdev->max_queues = 1 + vdev->fixed_queues_num;
-	}
 
-	/* negotiate the number of I/O queues. */
-	ret = vhost_user_sock(dev, VHOST_USER_GET_QUEUE_NUM, &host_max_queues);
-	if (ret < 0) {
-		return ret;
-	}
-
-	if (vdev->max_queues > host_max_queues + vdev->fixed_queues_num) {
-		SPDK_WARNLOG("%s: requested %"PRIu16" request queues"
-			     "but only %"PRIu64" available\n",
-			     vdev->name, vdev->max_queues - vdev->fixed_queues_num,
-			     host_max_queues);
-		vdev->max_queues = host_max_queues;
+	if (dev->backend_type == VIRTIO_USER_BACKEND_VHOST_USER) { 
+		/* negotiate the number of I/O queues. */
+		ret = dev->ops->get_queue_num(vdev);
+		if (ret < 0) {
+			return ret;
+		}
 	}
 
 	/* tell vhost to create queues */
@@ -735,14 +443,36 @@ virtio_user_start_device(struct virtio_dev *vdev)
 		return ret;
 	}
 
-	return virtio_user_queue_setup(vdev, virtio_user_kick_queue);
+        ret = virtio_user_queue_setup(vdev, virtio_user_kick_queue);
+        if (ret < 0) {
+                return ret;
+        }
+
+	if (dev->backend_type == VIRTIO_USER_BACKEND_VHOST_VDPA) {
+		for (int i = 0; i < vdev->max_queues; i++) {
+			ret = dev->ops->enable_qp(dev, i, 1);
+			if (ret < 0)
+				return ret;
+		}
+	}
+
+	return 0;
 }
 
 static int
 virtio_user_stop_device(struct virtio_dev *vdev)
 {
+	struct virtio_user_dev *dev = vdev->ctx;
 	int ret;
+	uint32_t i;
 
+	if (dev->backend_type == VIRTIO_USER_BACKEND_VHOST_VDPA) {
+		for (i = 0; i < vdev->max_queues; ++i) {
+			ret = dev->ops->enable_qp(dev, i, 0);
+			if (ret < 0)
+				return ret;
+		}
+	}
 	ret = virtio_user_queue_setup(vdev, virtio_user_stop_queue);
 	/* a queue might fail to stop for various reasons, e.g. socket
 	 * connection going down, but this mustn't prevent us from freeing
@@ -760,12 +490,22 @@ virtio_user_dev_setup(struct virtio_dev *vdev)
 
 	dev->vhostfd = -1;
 
+	if (dev->backend_type == VIRTIO_USER_BACKEND_VHOST_VDPA) {
+		dev->ops = &virtio_ops_vdpa;
+		vdev->is_hw = 1;
+	}
+	else
+	{
+		dev->ops = &virtio_ops_user;
+		vdev->is_hw = 0;
+	}
+
 	for (i = 0; i < SPDK_VIRTIO_MAX_VIRTQUEUES; ++i) {
 		dev->callfds[i] = -1;
 		dev->kickfds[i] = -1;
 	}
 
-	return vhost_user_setup(dev);
+	return dev->ops->setup(dev);
 }
 
 static int
@@ -773,23 +513,14 @@ virtio_user_read_dev_config(struct virtio_dev *vdev, size_t offset,
 			    void *dst, int length)
 {
 	struct virtio_user_dev *dev = vdev->ctx;
-	struct vhost_user_config cfg = {0};
 	int rc;
 
-	if ((dev->protocol_features & (1ULL << VHOST_USER_PROTOCOL_F_CONFIG)) == 0) {
-		return -ENOTSUP;
-	}
-
-	cfg.offset = 0;
-	cfg.size = VHOST_USER_MAX_CONFIG_SIZE;
-
-	rc = vhost_user_sock(dev, VHOST_USER_GET_CONFIG, &cfg);
+	rc = dev->ops->get_config(dev, dst, offset, length);
 	if (rc < 0) {
 		SPDK_ERRLOG("get_config failed: %s\n", spdk_strerror(-rc));
 		return rc;
 	}
 
-	memcpy(dst, cfg.region + offset, length);
 	return 0;
 }
 
@@ -798,18 +529,9 @@ virtio_user_write_dev_config(struct virtio_dev *vdev, size_t offset,
 			     const void *src, int length)
 {
 	struct virtio_user_dev *dev = vdev->ctx;
-	struct vhost_user_config cfg = {0};
 	int rc;
 
-	if ((dev->protocol_features & (1ULL << VHOST_USER_PROTOCOL_F_CONFIG)) == 0) {
-		return -ENOTSUP;
-	}
-
-	cfg.offset = offset;
-	cfg.size = length;
-	memcpy(cfg.region, src, length);
-
-	rc = vhost_user_sock(dev, VHOST_USER_SET_CONFIG, &cfg);
+	rc = dev->ops->set_config(dev, src, offset, length);
 	if (rc < 0) {
 		SPDK_ERRLOG("set_config failed: %s\n", spdk_strerror(-rc));
 		return rc;
@@ -825,12 +547,13 @@ virtio_user_set_status(struct virtio_dev *vdev, uint8_t status)
 	int rc = 0;
 
 	if ((dev->status & VIRTIO_CONFIG_S_NEEDS_RESET) &&
-	    status != VIRTIO_CONFIG_S_RESET) {
+			status != VIRTIO_CONFIG_S_RESET) {
 		rc = -1;
 	} else if (status & VIRTIO_CONFIG_S_DRIVER_OK) {
 		rc = virtio_user_start_device(vdev);
+
 	} else if (status == VIRTIO_CONFIG_S_RESET &&
-		   (dev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
+			(dev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
 		rc = virtio_user_stop_device(vdev);
 	}
 
@@ -839,12 +562,20 @@ virtio_user_set_status(struct virtio_dev *vdev, uint8_t status)
 	} else {
 		dev->status = status;
 	}
+
+	if (dev->backend_type == VIRTIO_USER_BACKEND_VHOST_VDPA) {
+		virtio_user_dev_set_status(dev, dev->status);
+	}
 }
 
 static uint8_t
 virtio_user_get_status(struct virtio_dev *vdev)
 {
 	struct virtio_user_dev *dev = vdev->ctx;
+
+	if (dev->backend_type == VIRTIO_USER_BACKEND_VHOST_VDPA) {
+		virtio_user_dev_update_status(dev);
+	}
 
 	return dev->status;
 }
@@ -856,7 +587,7 @@ virtio_user_get_features(struct virtio_dev *vdev)
 	uint64_t features;
 	int rc;
 
-	rc = vhost_user_sock(dev, VHOST_USER_GET_FEATURES, &features);
+	rc = dev->ops->get_features(dev, &features);
 	if (rc < 0) {
 		SPDK_ERRLOG("get_features failed: %s\n", spdk_strerror(-rc));
 		return 0;
@@ -872,7 +603,7 @@ virtio_user_set_features(struct virtio_dev *vdev, uint64_t features)
 	uint64_t protocol_features;
 	int ret;
 
-	ret = vhost_user_sock(dev, VHOST_USER_SET_FEATURES, &features);
+	ret = dev->ops->set_features(dev, &features);
 	if (ret < 0) {
 		return ret;
 	}
@@ -880,18 +611,13 @@ virtio_user_set_features(struct virtio_dev *vdev, uint64_t features)
 	vdev->negotiated_features = features;
 	vdev->modern = virtio_dev_has_feature(vdev, VIRTIO_F_VERSION_1);
 
-	if (!virtio_dev_has_feature(vdev, VHOST_USER_F_PROTOCOL_FEATURES)) {
-		/* nothing else to do */
-		return 0;
-	}
 
-	ret = vhost_user_sock(dev, VHOST_USER_GET_PROTOCOL_FEATURES, &protocol_features);
+	ret = dev->ops->get_protocol_features(vdev, &protocol_features);
 	if (ret < 0) {
 		return ret;
 	}
 
-	protocol_features &= VIRTIO_USER_SUPPORTED_PROTOCOL_FEATURES;
-	ret = vhost_user_sock(dev, VHOST_USER_SET_PROTOCOL_FEATURES, &protocol_features);
+	ret = dev->ops->set_protocol_features(dev, &protocol_features);
 	if (ret < 0) {
 		return ret;
 	}
@@ -965,7 +691,9 @@ virtio_user_setup_queue(struct virtio_dev *vdev, struct virtqueue *vq)
 	struct vhost_vring_state state;
 	uint16_t queue_idx = vq->vq_queue_index;
 	void *queue_mem;
-	int callfd, kickfd, rc;
+	int callfd, kickfd,rc;
+	uint64_t phys_addr, phys_len = vq->vq_ring_size;
+
 
 	if (dev->callfds[queue_idx] != -1 || dev->kickfds[queue_idx] != -1) {
 		SPDK_ERRLOG("queue %"PRIu16" already exists\n", queue_idx);
@@ -990,38 +718,60 @@ virtio_user_setup_queue(struct virtio_dev *vdev, struct virtqueue *vq)
 	}
 
 	queue_mem = spdk_zmalloc(vq->vq_ring_size, VIRTIO_PCI_VRING_ALIGN, NULL,
-				 SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+			SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 	if (queue_mem == NULL) {
 		close(kickfd);
 		close(callfd);
 		return -ENOMEM;
 	}
 
-	vq->vq_ring_mem = SPDK_VTOPHYS_ERROR;
-	vq->vq_ring_virt_mem = queue_mem;
-
-	state.index = vq->vq_queue_index;
-	state.num = 1;
-
-	if (virtio_dev_has_feature(vdev, VHOST_USER_F_PROTOCOL_FEATURES)) {
-		rc = vhost_user_sock(dev, VHOST_USER_SET_VRING_ENABLE, &state);
-		if (rc < 0) {
-			SPDK_ERRLOG("failed to send VHOST_USER_SET_VRING_ENABLE: %s\n",
-				    spdk_strerror(-rc));
+	if (vdev->is_hw) {
+		phys_addr = spdk_vtophys(queue_mem, &phys_len);
+		if (phys_addr == SPDK_VTOPHYS_ERROR || phys_len < vq->vq_ring_size) {
+			SPDK_ERRLOG("vDPA: failed to translate ring to physical address, phys_len:%ld, vq->vq_ring_size:%d\n",phys_len, vq->vq_ring_size);
 			close(kickfd);
 			close(callfd);
 			spdk_free(queue_mem);
-			return -rc;
+			return -EFAULT;
+		}
+		vq->vq_ring_mem = phys_addr;
+	}
+	else
+	{
+		vq->vq_ring_mem = (uintptr_t) queue_mem;
+	}
+
+	vq->vq_ring_virt_mem = queue_mem;
+
+	if (dev->backend_type == VIRTIO_USER_BACKEND_VHOST_USER) {
+		state.index = vq->vq_queue_index;
+		state.num = 1;
+
+		if (virtio_dev_has_feature(vdev, VHOST_USER_F_PROTOCOL_FEATURES)) {
+			rc =  dev->ops->set_vring_enable(dev, &state);
+			if (rc < 0) {
+				SPDK_ERRLOG("failed to send VHOST_USER_SET_VRING_ENABLE: %s\n",
+						spdk_strerror(-rc));
+				close(kickfd);
+				close(callfd);
+				spdk_free(queue_mem);
+				return -rc;
+			}
 		}
 	}
 
 	dev->callfds[queue_idx] = callfd;
 	dev->kickfds[queue_idx] = kickfd;
 
-        if (virtio_with_packed_queue(vdev))
-                virtio_user_setup_queue_packed(vq, dev);
-        else
-                virtio_user_setup_queue_split(vq, dev);
+	if (virtio_with_packed_queue(vdev))
+		virtio_user_setup_queue_packed(vq, dev);
+	else
+		virtio_user_setup_queue_split(vq, dev);
+
+	if (dev->notify_area)
+	{
+		vq->notify_addr = dev->notify_area[vq->vq_queue_index];
+	}
 
 	return 0;
 }
@@ -1051,12 +801,37 @@ virtio_user_del_queue(struct virtio_dev *vdev, struct virtqueue *vq)
 static void
 virtio_user_notify_queue(struct virtio_dev *vdev, struct virtqueue *vq)
 {
-	uint64_t buf = 1;
+	uint64_t notify_data = 1;
 	struct virtio_user_dev *dev = vdev->ctx;
 
-	if (write(dev->kickfds[vq->vq_queue_index], &buf, sizeof(buf)) < 0) {
-		SPDK_ERRLOG("failed to kick backend: %s.\n", spdk_strerror(errno));
-	}
+	if (!dev->notify_area) {
+		if (write(dev->kickfds[vq->vq_queue_index], &notify_data, sizeof(notify_data)) < 0) {
+			SPDK_ERRLOG("failed to kick backend: %s.\n", spdk_strerror(errno));
+		}
+		return;
+        } else if (!virtio_dev_has_feature(vdev, VIRTIO_F_NOTIFICATION_DATA)) {
+		spdk_write16(vq->vq_queue_index, vq->notify_addr);
+                return;
+        }
+
+        if (virtio_with_packed_queue(vdev)) {
+                /* Bit[0:15]: vq queue index
+                 * Bit[16:30]: avail index
+                 * Bit[31]: avail wrap counter
+                 */
+                notify_data = ((uint32_t)(!!(vq->vq_packed.cached_flags &
+                                SPDK_VRING_PACKED_DESC_F_AVAIL)) << 31) |
+                                ((uint32_t)vq->vq_avail_idx << 16) |
+                                vq->vq_queue_index;
+        } else {
+                /* Bit[0:15]: vq queue index
+                 * Bit[16:31]: avail index
+                 */
+                notify_data = ((uint32_t)vq->vq_avail_idx << 16) |
+                                vq->vq_queue_index;
+        }
+
+	spdk_write32(notify_data, vq->notify_addr);
 }
 
 static void
@@ -1090,6 +865,33 @@ virtio_user_write_json_config(struct virtio_dev *vdev, struct spdk_json_write_ct
 	spdk_json_write_named_uint32(w, "vq_size", virtio_dev_backend_ops(vdev)->get_queue_size(vdev, 0));
 }
 
+static int
+virtio_user_init_notify_queue (struct virtio_dev *vdev, uint16_t max_queues)
+{
+	struct virtio_user_dev *dev = vdev->ctx;
+
+        if (vdev->negotiated_features & (1ULL << VIRTIO_F_NOTIFICATION_DATA))
+	{
+            if (dev->ops->map_notification_area &&
+                                dev->ops->map_notification_area(dev, max_queues))
+	     {
+		     SPDK_ERRLOG("Failed map_notification_area\n");
+                        return -1;
+	     }
+	}
+        return 0;
+}
+
+static void
+virtio_user_uninit_notify_queue (struct virtio_dev *vdev, uint16_t max_queues)
+{
+      struct virtio_user_dev *dev = vdev->ctx;
+
+      if (dev->ops->unmap_notification_area && dev->notify_area)
+		dev->ops->unmap_notification_area(dev, max_queues);
+
+}
+
 static const struct virtio_dev_ops virtio_user_ops = {
 	.read_dev_cfg	= virtio_user_read_dev_config,
 	.write_dev_cfg	= virtio_user_write_dev_config,
@@ -1104,6 +906,8 @@ static const struct virtio_dev_ops virtio_user_ops = {
 	.notify_queue	= virtio_user_notify_queue,
 	.dump_json_info = virtio_user_dump_json_info,
 	.write_json_config = virtio_user_write_json_config,
+	.init_notify_queue = virtio_user_init_notify_queue,
+	.uninit_notify_queue = virtio_user_uninit_notify_queue,
 };
 
 int
@@ -1130,9 +934,16 @@ virtio_user_dev_init(struct virtio_dev *vdev, const char *name, const char *path
 		return rc;
 	}
 
-	vdev->is_hw = 0;
-
 	snprintf(dev->path, PATH_MAX, "%s", path);
+
+	if (strstr(dev->path, "/dev/vhost-vdpa") != NULL) {
+              dev->backend_type = VIRTIO_USER_BACKEND_VHOST_VDPA;
+	}
+	else
+	{
+               dev->backend_type = VIRTIO_USER_BACKEND_VHOST_USER;
+	}
+
 	dev->queue_size = queue_size;
 
 	rc = virtio_user_dev_setup(vdev);
@@ -1141,7 +952,7 @@ virtio_user_dev_init(struct virtio_dev *vdev, const char *name, const char *path
 		goto err;
 	}
 
-	rc = vhost_user_sock(dev, VHOST_USER_SET_OWNER, NULL);
+	rc = dev->ops->set_owner(dev);
 	if (rc < 0) {
 		SPDK_ERRLOG("set_owner fails: %s\n", spdk_strerror(-rc));
 		goto err;

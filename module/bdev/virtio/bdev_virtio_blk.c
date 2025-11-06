@@ -62,7 +62,9 @@ struct bdev_virtio_blk_io_channel {
 	 1ULL << VIRTIO_BLK_F_DISCARD		|	\
 	 1ULL << VIRTIO_BLK_F_FLUSH		|	\
 	 1ULL << VIRTIO_RING_F_EVENT_IDX        |       \
-	 1ULL << VIRTIO_F_RING_PACKED)
+	 1ULL << VIRTIO_F_RING_PACKED        	|       \
+	 1ULL << VIRTIO_F_NOTIFICATION_DATA   	|       \
+	 1ULL << VIRTIO_F_ORDER_PLATFORM)
 
 /* 10 sec for max poll period */
 #define VIRTIO_BLK_HOTPLUG_POLL_PERIOD_MAX		10000000ULL
@@ -134,6 +136,7 @@ bdev_virtio_blk_send_io(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io
 		virtqueue_req_add_iovs(vq, &io_ctx->iov_unmap, 1, SPDK_VIRTIO_DESC_RO);
 	} else if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ ||
 		   bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
+
 		virtqueue_req_add_iovs(vq, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt,
 				       bdev_io->type == SPDK_BDEV_IO_TYPE_READ ?
 				       SPDK_VIRTIO_DESC_WR : SPDK_VIRTIO_DESC_RO);
@@ -440,6 +443,7 @@ virtio_blk_dev_init(struct virtio_blk_dev *bvdev, uint16_t max_queues)
 	if (virtio_dev_has_feature(vdev, VIRTIO_BLK_F_MQ)) {
 		rc = virtio_dev_read_dev_config(vdev, offsetof(struct virtio_blk_config, num_queues),
 						&host_max_queues, sizeof(host_max_queues));
+
 		if (rc) {
 			SPDK_ERRLOG("%s: config read failed: %s\n", vdev->name, spdk_strerror(-rc));
 			return rc;
@@ -499,13 +503,7 @@ virtio_blk_dev_init(struct virtio_blk_dev *bvdev, uint16_t max_queues)
 		return -EINVAL;
 	}
 
-	if (max_queues > host_max_queues) {
-		SPDK_WARNLOG("%s: requested %"PRIu16" request queues "
-			     "but only %"PRIu16" available.\n",
-			     vdev->name, max_queues, host_max_queues);
-		max_queues = host_max_queues;
-	}
-
+	max_queues = host_max_queues;
 	/* bdev is tied with the virtio device; we can reuse the name */
 	bdev->name = vdev->name;
 	rc = virtio_dev_start(vdev, max_queues, 0);
